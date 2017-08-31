@@ -357,14 +357,21 @@ static void read_binary_data(const uint8_t* payload, const uint8_t* payload_end,
 static GdbThreadId parse_threadid(const char* str, char** endptr) {
   GdbThreadId t;
   char* endp;
+  bool multiprocess = false;
 
   if ('p' == *str) {
+    multiprocess = true;
     ++str;
   }
   t.pid = strtol(str, &endp, 16);
   parser_assert(endp);
   if ('\0' == *endp) {
-    t.tid = -1;
+    if (multiprocess) {
+      t.tid = -1;
+    } else {
+      t.tid = t.pid;
+      t.pid = -1;
+    }
     *endptr = endp;
     return t;
   }
@@ -629,6 +636,8 @@ bool GdbConnection::query(char* payload) {
     /* TODO process these */
     LOG(debug) << "gdb supports " << args;
 
+    multiprocess_supported_ = strstr(args, "multiprocess+") != nullptr;
+
     stringstream supported;
     // Encourage gdb to use very large packets since we support any packet size
     supported << "PacketSize=1048576"
@@ -638,7 +647,8 @@ bool GdbConnection::query(char* payload) {
                  ";qXfer:siginfo:read+"
                  ";qXfer:siginfo:write+"
                  ";multiprocess+"
-                 ";ConditionalBreakpoints+";
+                 ";ConditionalBreakpoints+"
+                 ";vContSupported+";
     if (features().reverse_execution) {
       supported << ";ReverseContinue+"
                    ";ReverseStep+";
@@ -956,6 +966,13 @@ bool GdbConnection::process_packet() {
   switch (request) {
     case 'b':
       ret = process_bpacket(payload);
+      break;
+    case 'c':
+      LOG(debug) << "gdb is asking to continue";
+      req = GdbRequest(DREQ_CONT);
+      req.cont().run_direction = RUN_FORWARD;
+      req.cont().actions.push_back(GdbContAction(ACTION_CONTINUE));
+      ret = true;
       break;
     case 'D':
       LOG(debug) << "gdb is detaching from us";
@@ -1336,8 +1353,13 @@ void GdbConnection::send_stop_reply_packet(GdbThreadId thread, int sig,
     watch[0] = '\0';
   }
   char buf[PATH_MAX];
-  snprintf(buf, sizeof(buf) - 1, "T%02xthread:p%02x.%02x;%s",
+  if (multiprocess_supported_) {
+    snprintf(buf, sizeof(buf) - 1, "T%02xthread:p%02x.%02x;%s",
            to_gdb_signum(sig), thread.pid, thread.tid, watch);
+  } else {
+    snprintf(buf, sizeof(buf) - 1, "T%02xthread:%02x;%s",
+           to_gdb_signum(sig), thread.tid, watch);
+  }
   write_packet(buf);
 }
 
@@ -1380,7 +1402,11 @@ void GdbConnection::reply_get_current_thread(GdbThreadId thread) {
   DEBUG_ASSERT(DREQ_GET_CURRENT_THREAD == req.type);
 
   char buf[1024];
-  snprintf(buf, sizeof(buf), "QCp%02x.%02x", thread.pid, thread.tid);
+  if (multiprocess_supported_) {
+    snprintf(buf, sizeof(buf), "QCp%02x.%02x", thread.pid, thread.tid);
+  } else {
+    snprintf(buf, sizeof(buf), "QC%02x", thread.tid);
+  }
   write_packet(buf);
 
   consume_request();
@@ -1541,8 +1567,12 @@ void GdbConnection::reply_get_thread_list(const vector<GdbThreadId>& threads) {
       if (tgid != t.pid) {
         continue;
       }
-      offset +=
+      if (multiprocess_supported_) {
+        offset +=
           snprintf(&str[offset], maxlen - offset, "p%02x.%02x,", t.pid, t.tid);
+      } else {
+        offset += snprintf(&str[offset], maxlen - offset, "%02x,", t.tid);
+      }
     }
     /* Overwrite the trailing ',' */
     str[offset - 1] = '\0';
